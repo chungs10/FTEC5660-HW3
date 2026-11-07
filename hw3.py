@@ -12,7 +12,10 @@ import threading
 import zlib
 from pathlib import Path
 from typing import Any
-
+import os
+import re
+from langchain_deepseek import ChatDeepSeek
+from langchain_core.prompts import ChatPromptTemplate
 
 MODEL_NAME = "deepseek-v4-flash"
 INTERVIEW_LIMIT = 10
@@ -40,6 +43,20 @@ FISHER_POINTS = {
 }
 VERDICTS = ("PASS", "FAIL")
 
+def response_text(value):
+    content = getattr(value, "content", value)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [b if isinstance(b, str) else b.get("text", "") if isinstance(b, dict) else "" for b in content]
+        return "\n".join(p for p in parts if p).strip()
+    return str(content).strip()
+
+def parse_json(resp):
+    text = response_text(resp)
+    m = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+    return json.loads(m.group(0)) if m else {}
+
 
 def load_env_file(path: Path = Path(".env")) -> None:
     """Load the simple KEY=VALUE entries used by this homework."""
@@ -57,7 +74,7 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1,4,5]  ### YOUR CODE HERE
 
 
 def build_agent() -> Any:
@@ -72,7 +89,44 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    llm = ChatDeepSeek(
+        model=MODEL_NAME,
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        temperature=0.0
+    )
+    interview_chain = ChatPromptTemplate.from_messages([
+        ("system",
+         "You choose who to interview for Fisher's point 4:\n"
+         f"  '{FISHER_POINTS[4]}'\n\n"
+         "Only customers and competitors know about the sales team.\n"
+         "The topic must be 'sales_team'.\n"
+         "Pick either 'customer' or 'competitor'.\n"
+         'Return ONLY JSON: {{"role": "...", "topic": "sales_team"}}'),
+    ]) | llm
+
+    sentiment_chain = ChatPromptTemplate.from_messages([
+        ("system",
+         "Read this interview quote and classify the speaker's attitude "
+         "toward the company's sales team.\n"
+         'Return ONLY JSON: {{"sentiment": "positive" | "negative" | "neutral", '
+         '"reason": "one short sentence"}}\n\n'
+         "Quote:\n{quote}"),
+    ]) | llm
+
+    summary_chain = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a Fisher-style investment analyst. Given the computed verdicts "
+         "below, write 2-3 sentences explaining them to an investor.\n"
+         'Return ONLY JSON: {{"summary": "..."}}'),
+        ("human", "{input}"),
+    ]) | llm
+
+    return {
+        "llm": llm,
+        "interview_chain": interview_chain,
+        "sentiment_chain": sentiment_chain,
+        "summary_chain": summary_chain,
+    }
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +163,84 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    
+    def parse_sql(text):
+        lines = [l for l in text.strip().splitlines()
+                 if l and not l.startswith("(") and not l.startswith("...")]
+        if not lines:
+            return []
+        header = [h.strip() for h in lines[0].split("|")]
+        return [dict(zip(header, [c.strip() for c in r.split("|")])) for r in lines[1:]]
+
+    async def one_company(name, tools):
+        try:
+            list_docs, read_doc, sql, interview = tools
+
+            #Point 1
+            rev_rows = parse_sql(await sql.ainvoke({
+                "query": "SELECT substr(order_date,1,4) AS yr, SUM(amount) AS rev FROM orders GROUP BY yr ORDER BY yr"
+            }))
+            rev = {r["yr"]: float(r["rev"]) for r in rev_rows if r.get("yr")}
+            growth_2y = ((rev.get("2025", 0) - rev.get("2023", 0)) / rev["2023"] * 100) if rev.get("2023") else 0.0
+
+            med = (parse_sql(await sql.ainvoke({
+                "query": "SELECT m.revenue_growth_2y_pct, m.operating_margin_pct FROM industry_medians m JOIN company c ON c.industry = m.industry"
+            })) or [{}])[0]
+            med_growth = float(med.get("revenue_growth_2y_pct", 0))
+            med_margin = float(med.get("operating_margin_pct", 0))
+            p1 = "PASS" if growth_2y >= med_growth else "FAIL"
+
+            #Point 5
+            cost = (parse_sql(await sql.ainvoke({
+                "query": "SELECT SUM(cost_of_sales) AS cogs, SUM(selling_admin) AS sga, SUM(research_development) AS rd FROM monthly_costs WHERE substr(month,1,4)='2025'"
+            })) or [{}])[0]
+            rv = rev.get("2025", 0)
+            if rv and cost.get("cogs") not in (None, ""):
+                margin = (rv - float(cost["cogs"]) - float(cost["sga"]) - float(cost["rd"])) / rv * 100
+            else:
+                margin = 0.0
+            p5 = "PASS" if margin >= med_margin else "FAIL"
+
+            #Point 4
+            routing = parse_json(await agent["interview_chain"].ainvoke({}))
+            role = str(routing.get("role", "customer")).strip().lower()
+            topic = str(routing.get("topic", "sales_team")).strip().lower()
+            if role not in ("customer", "competitor") or topic != "sales_team":
+                role, topic = "customer", "sales_team"
+
+            quote = await interview.ainvoke({"role": role, "topic": topic})
+
+            extraction = parse_json(await agent["sentiment_chain"].ainvoke({"quote": quote}))
+            sentiment = str(extraction.get("sentiment", "neutral")).lower()
+            p4 = "PASS" if sentiment == "positive" else "FAIL"
+
+            #Point Summary
+            try:
+                summary_resp = await agent["summary_chain"].ainvoke({
+                    "input": (f"Point 1: {p1} (2y revenue growth {growth_2y:.1f}% vs median {med_growth:.1f}%). "
+                              f"Point 4: {p4} (interviewed {role} about {topic}: \"{quote[:200]}\"). "
+                              f"Point 5: {p5} (2025 operating margin {margin:.1f}% vs median {med_margin:.1f}%). "
+                              f"Write 2-3 sentences explaining these verdicts to an investor.")
+                })
+                summary = parse_json(summary_resp).get("summary", f"P1 {p1}, P4 {p4}, P5 {p5}")
+            except Exception:
+                summary = f"P1 {p1}, P4 {p4}, P5 {p5}"
+
+            return name, {"points": {1: p1, 4: p4, 5: p5}, "summary": summary}
+
+        except Exception as e:
+            return name, {
+                "points": {1: "FAIL", 4: "FAIL", 5: "FAIL"},
+                "summary": f"Error: {type(e).__name__}: {e}",
+            }
+
+    sem = asyncio.Semaphore(5)
+
+    async def guarded(n, t):
+        async with sem:
+            return await one_company(n, t)
+
+    return dict(await asyncio.gather(*[guarded(n, t) for n, t in companies.items()]))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
