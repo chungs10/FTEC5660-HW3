@@ -175,6 +175,8 @@ names and wording, and scores your 3 points only.
 
 ### My 3 points and rules
 > for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+
 **Point 1 — Market potential for sales growth.** Fisher asks: *"Does the company have products or services with sufficient market potential to make possible a sizable increase in sales for at least several years?"*
 I chose this question because it is essential for investors to know the future success of the company and not a one-off thing that they created to sell in a heartbeat. It can also be computed using only the database and does not require the LLM for any sort of arithmetic, making it easily quantifiable with no hallucinations.
 The PASS rule is using the 2-year revenue growth between the fiscal years and checking it against the industry median in the database.
@@ -253,6 +255,8 @@ The design splits work by evidence type because LLMs are unreliable at arithmeti
 
 ### Results
 > your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+
 Point score on `public_test`: **60/60 (balanced 100.0%)**. All 20 companies matched the answer key on all 3 points, so there are no disagreeing companies to explain. I validated the rules on Ashgrove Labs manually first — checking that the growth number, the margin calculation, and the sales-team quote all gave the expected verdicts — and then ran the full pipeline to confirm they generalized across all 20 companies.
 
 
